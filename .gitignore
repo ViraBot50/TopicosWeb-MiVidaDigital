@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 
+
 # Dependencias
 node_modules/
 
