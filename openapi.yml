@@ -1,0 +1,893 @@
+openapi: 3.0.3
+info:
+  title: MiVida Digital API
+  version: "1.1.1"
+  description: |
+    Contrato de la API hasta el Paso 2 (perfil, categorías, etiquetas, documentos, archivos),
+    más sesión, Drive y autenticación OAuth.
+
+    Convenciones:
+    - Rutas bajo `/api` (sin `/v1`). El flujo OAuth vive en `/auth/*` (redirecciones, no JSON).
+    - Autenticación por cookies httpOnly de Supabase (no hay `Authorization: Bearer`).
+    - Las peticiones que modifican datos (POST, PUT, PATCH, DELETE; incluye `/auth/logout`) deben llevar
+      `Origin` igual al origen de `CLIENT_URL`; si no, responden 403 `ORIGEN_NO_PERMITIDO`.
+      El navegador lo envía solo. Sin `Origin` (curl, pruebas) solo se acepta fuera de producción.
+    - Ids `bigint`: se envían como número o texto numérico. Un id no numérico da 400 VALIDACION.
+    - Fechas `AAAA-MM-DD`; timestamps ISO 8601 UTC.
+    - En campos opcionales, `""` se trata como `null`. En query params, `""` equivale a no enviado.
+    - Errores: `{ codigo, mensaje, detalles? }`. Excepciones documentadas en "Inconsistencias conocidas".
+
+    Inconsistencias conocidas (pendientes de unificar):
+    - `/auth/login/{proveedor}` (400), `/api/drive/estado` (500) y `DELETE /api/drive/conexion` (500)
+      responden solo `{ mensaje }`, sin `codigo`.
+    - `POST /api/archivos/upload` no valida tipo ni firma del archivo.
+    - La validación de tipo en `POST /api/documentos` usa el `mimetype` declarado (falsificable).
+    - Falta rate limit y helmet.
+
+    No implementado aún: recordatorios, notificaciones, calendario, tareas, fichas,
+    movimientos, reglas de impuestos, cálculos, CSV, visualización inline, perfil en `/api/session`.
+servers:
+  - url: http://localhost:3000
+    description: Desarrollo (ajustar puerto)
+  - url: https://TU-SERVICIO.onrender.com
+    description: Render (ajustar)
+tags:
+  - name: Salud y sesión
+  - name: Autenticación
+  - name: Drive
+  - name: Perfil
+  - name: Categorías
+  - name: Etiquetas
+  - name: Documentos
+  - name: Archivos
+
+security:
+  - cookieSesion: []
+
+paths:
+  /api/health:
+    get:
+      tags: [Salud y sesión]
+      summary: Estado del servidor y de Supabase
+      security: []
+      responses:
+        "200":
+          description: Todo funcionando
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Salud" }
+              example: { servidor: funcionando, supabase: conectado }
+        "503":
+          description: Supabase no responde
+          content:
+            application/json:
+              example: { servidor: funcionando, supabase: error }
+
+  /api/session:
+    get:
+      tags: [Salud y sesión]
+      summary: Estado de la sesión actual
+      description: |
+        Siempre responde 200 (`autenticado: true|false`), salvo que Supabase no esté
+        disponible (503). El frontend lo consulta al abrir, al volver a la pestaña y periódicamente.
+        El perfil (tabla `perfiles`) todavía no se incluye; nombre y foto salen de la metadata OAuth.
+      security: []
+      responses:
+        "200":
+          description: Sesión consultada
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/SesionInactiva"
+                  - $ref: "#/components/schemas/SesionActiva"
+              examples:
+                sinSesion:
+                  value: { autenticado: false }
+                conSesion:
+                  value:
+                    autenticado: true
+                    usuario:
+                      id: 0b6f1c1e-0000-0000-0000-000000000000
+                      nombre: Ana Pérez
+                      correo: ana@correo.com
+                      foto: null
+                      proveedores: [google]
+                    drive: { conectado: true, correo: ana@gmail.com }
+        "503":
+          description: No se pudo validar la sesión (Supabase no disponible)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { codigo: AUTH_NO_DISPONIBLE, mensaje: No se pudo validar la sesión. }
+
+  # ===================== AUTENTICACIÓN (/auth) =====================
+  /auth/login/{proveedor}:
+    get:
+      tags: [Autenticación]
+      summary: Inicia el login OAuth (redirección al proveedor)
+      description: |
+        Redirige (302) al proveedor. Guarda la cookie `auth_provider` (10 min) para saber si
+        guardar el token de Drive. Con Google se piden además los scopes de Drive
+        (`drive.file`, acceso offline y `prompt=consent`).
+        Si Supabase no entrega la URL, redirige a `CLIENT_URL/?error=login`.
+        Debe abrirse como navegación (no con fetch).
+      security: []
+      parameters:
+        - name: proveedor
+          in: path
+          required: true
+          schema: { type: string, enum: [google, github, discord] }
+      responses:
+        "302": { description: Redirección al proveedor OAuth (o a `CLIENT_URL/?error=login`) }
+        "400":
+          description: Proveedor no válido (respuesta sin `codigo`)
+          content:
+            application/json:
+              example: { mensaje: Proveedor de inicio de sesión no válido. }
+
+  /auth/callback:
+    get:
+      tags: [Autenticación]
+      summary: Retorno de Supabase tras el login (uso interno del flujo OAuth)
+      description: |
+        Intercambia `code` por sesión y fija las cookies httpOnly.
+        Si el login fue con Google y llega `provider_refresh_token`, guarda la conexión de Drive
+        (cifrada). Si eso falla, la sesión se mantiene y el usuario puede conectar Drive manualmente.
+        Redirige a `CLIENT_URL`, o a `CLIENT_URL/?error=login` si falla.
+      security: []
+      parameters:
+        - { name: code, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+      responses:
+        "302": { description: Redirección al frontend }
+
+  /auth/logout:
+    post:
+      tags: [Autenticación]
+      summary: Cierra la sesión
+      description: |
+        Si falla la revocación remota igualmente se limpian las cookies
+        (excepto con `scope: others`). Sin sesión también responde 200.
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                scope:
+                  type: string
+                  enum: [local, global, others]
+                  default: local
+                  description: local = este dispositivo; global = todos; others = las demás y conserva esta
+      responses:
+        "200":
+          description: Sesión cerrada
+          content:
+            application/json:
+              example: { mensaje: Sesión cerrada correctamente., scope: local }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+
+  # ===================== DRIVE =====================
+  /api/drive/estado:
+    get:
+      tags: [Drive]
+      summary: Estado de la conexión con Google Drive
+      responses:
+        "200":
+          description: Estado de conexión
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EstadoDrive" }
+              example: { conectado: true, correo: ana@gmail.com }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "500":
+          description: No se pudo consultar (respuesta sin `codigo`)
+          content:
+            application/json:
+              example: { mensaje: No se pudo consultar el estado de Drive. }
+
+  /api/drive/conectar:
+    get:
+      tags: [Drive]
+      summary: Inicia la conexión con Drive (redirección a Google)
+      description: |
+        Para usuarios que entraron con GitHub o Discord, o para reconectar.
+        Guarda la cookie `drive_oauth_state` (10 min) y redirige (302) a Google con
+        `access_type=offline` y `prompt=consent`. Debe abrirse como navegación.
+        Sin sesión redirige al frontend en lugar de responder 401 (verificar `requiereAutenticacion({ redirigir: true })`).
+      responses:
+        "302": { description: Redirección a Google (o al frontend si no hay sesión) }
+
+  /api/drive/callback:
+    get:
+      tags: [Drive]
+      summary: Retorno de Google (uso interno; URI registrada en Google Cloud, no moverla)
+      description: |
+        Valida `state` contra la cookie, intercambia `code` por tokens y guarda el refresh token
+        cifrado. Redirige a `CLIENT_URL/?drive=conectado` o `CLIENT_URL/?drive=error`
+        (error de Google, state inválido o Google no entregó refresh token).
+      parameters:
+        - { name: code, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+      responses:
+        "302": { description: Redirección al frontend con `?drive=conectado` o `?drive=error` }
+
+  /api/drive/conexion:
+    delete:
+      tags: [Drive]
+      summary: Desconecta Drive (revoca el permiso en Google)
+      responses:
+        "200":
+          description: Desconectado
+          content:
+            application/json:
+              example: { mensaje: Google Drive desconectado. }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "500":
+          description: No se pudo desconectar (respuesta sin `codigo`)
+          content:
+            application/json:
+              example: { mensaje: No se pudo desconectar Google Drive. }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+
+  # ===================== PERFIL =====================
+  /api/perfil:
+    get:
+      tags: [Perfil]
+      summary: Obtiene el perfil (lo crea vacío si no existía)
+      responses:
+        "200":
+          description: Perfil
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  perfil: { $ref: "#/components/schemas/Perfil" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+    patch:
+      tags: [Perfil]
+      summary: Actualiza el perfil (al menos un campo)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ActualizarPerfil" }
+            example: { nombre: Ana, apellidos: Pérez, telefono: "+52 461 123 4567", zona_horaria: America/Mexico_City }
+      responses:
+        "200":
+          description: Perfil actualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mensaje: { type: string, example: Perfil actualizado correctamente. }
+                  perfil: { $ref: "#/components/schemas/Perfil" }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+
+  # ===================== CATEGORÍAS =====================
+  /api/categorias:
+    get:
+      tags: [Categorías]
+      summary: Categorías de documento (lista fija, igual al CHECK de la BD)
+      responses:
+        "200":
+          description: Lista
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  categorias:
+                    type: array
+                    items: { $ref: "#/components/schemas/Categoria" }
+              example:
+                categorias:
+                  - { slug: identidad, nombre: Identidad }
+                  - { slug: vivienda, nombre: Vivienda }
+                  - { slug: salud, nombre: Salud }
+                  - { slug: vehiculos, nombre: Vehículos }
+                  - { slug: trabajo, nombre: Trabajo }
+                  - { slug: finanzas, nombre: Finanzas }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+
+  # ===================== ETIQUETAS =====================
+  /api/etiquetas:
+    get:
+      tags: [Etiquetas]
+      summary: Etiquetas del usuario, ordenadas por nombre
+      responses:
+        "200":
+          description: Lista
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  etiquetas:
+                    type: array
+                    items: { $ref: "#/components/schemas/Etiqueta" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+    post:
+      tags: [Etiquetas]
+      summary: Crea una etiqueta (unicidad sin distinguir mayúsculas)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NombreEtiqueta" }
+      responses:
+        "201":
+          description: Creada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RespuestaEtiqueta" }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "409": { $ref: "#/components/responses/Conflicto" }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+
+  /api/etiquetas/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    patch:
+      tags: [Etiquetas]
+      summary: Renombra una etiqueta
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NombreEtiqueta" }
+      responses:
+        "200":
+          description: Actualizada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RespuestaEtiqueta" }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "404": { $ref: "#/components/responses/NoEncontrado" }
+        "409": { $ref: "#/components/responses/Conflicto" }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+    delete:
+      tags: [Etiquetas]
+      summary: Elimina una etiqueta (se quita de los documentos)
+      responses:
+        "200":
+          description: Eliminada
+          content:
+            application/json:
+              example: { mensaje: Etiqueta eliminada correctamente. }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "404": { $ref: "#/components/responses/NoEncontrado" }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+
+  # ===================== DOCUMENTOS =====================
+  /api/documentos:
+    get:
+      tags: [Documentos]
+      summary: Lista y filtra documentos
+      description: |
+        `estado` se calcula con la `zona_horaria` del perfil.
+        Si `offset` queda fuera de rango devuelve lista vacía y `total: null`.
+      parameters:
+        - { name: q, in: query, description: Búsqueda parcial por nombre (ILIKE, máx. 100), schema: { type: string, maxLength: 100 } }
+        - { name: categoria, in: query, schema: { $ref: "#/components/schemas/SlugCategoria" } }
+        - { name: etiqueta, in: query, description: Id de etiqueta, schema: { type: integer, minimum: 1 } }
+        - { name: estado, in: query, schema: { $ref: "#/components/schemas/EstadoDocumento" } }
+        - { name: vence_antes, in: query, description: Inclusivo, schema: { type: string, format: date } }
+        - { name: vence_despues, in: query, description: Inclusivo, schema: { type: string, format: date } }
+        - { name: orden, in: query, schema: { type: string, enum: [recientes, vencimiento, nombre], default: recientes } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        "200":
+          description: Página de documentos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  documentos:
+                    type: array
+                    items: { $ref: "#/components/schemas/Documento" }
+                  paginacion: { $ref: "#/components/schemas/Paginacion" }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+    post:
+      tags: [Documentos]
+      summary: Crea un documento subiendo su archivo a Drive
+      description: |
+        Sube a Drive, registra en `archivos` y crea el documento. Si algo falla a mitad,
+        se limpian documento, registro de archivo y archivo en Drive.
+        El tipo se valida por el `mimetype` declarado (la verificación por firma está pendiente).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: "#/components/schemas/CrearDocumento" }
+      responses:
+        "201":
+          description: Creado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RespuestaDocumento" }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "409":
+          description: Drive no conectado (`DRIVE_NO_CONECTADO`) o conflicto
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { codigo: DRIVE_NO_CONECTADO, mensaje: Debes conectar tu Google Drive. }
+        "413": { $ref: "#/components/responses/ArchivoGrande" }
+        "415": { $ref: "#/components/responses/TipoNoPermitido" }
+        "502": { $ref: "#/components/responses/ErrorDrive" }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+
+  /api/documentos/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Documentos]
+      summary: Detalle de un documento
+      responses:
+        "200":
+          description: Documento
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  documento: { $ref: "#/components/schemas/Documento" }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "404": { $ref: "#/components/responses/NoEncontrado" }
+    patch:
+      tags: [Documentos]
+      summary: Edita metadatos (al menos un campo)
+      description: |
+        - `etiquetas` reemplaza el conjunto completo (`[]` quita todas). Si se omite, no cambian.
+        - `null` o `""` borran un campo opcional.
+        - La coherencia de fechas se valida en el esquema solo si llegan ambas;
+          si llega una sola, la valida la BD y responde 400 VALIDACION.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ActualizarDocumento" }
+      responses:
+        "200":
+          description: Actualizado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RespuestaDocumento" }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "404": { $ref: "#/components/responses/NoEncontrado" }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+    delete:
+      tags: [Documentos]
+      summary: Elimina el documento, su registro de archivo y el archivo en Drive
+      description: |
+        Orden: documento, registro de archivo, Drive. Si Drive falla, el documento igual se borra
+        y `driveEliminado` es false.
+      responses:
+        "200":
+          description: Eliminado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mensaje: { type: string }
+                  driveEliminado: { type: boolean }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "404": { $ref: "#/components/responses/NoEncontrado" }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+
+  /api/documentos/{id}/descargar:
+    get:
+      tags: [Documentos]
+      summary: Descarga el archivo del documento (streaming, `attachment`)
+      description: Todavía no existe modo inline.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Contenido binario
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "404":
+          description: Documento no existe, o el archivo ya no está en Drive
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Drive no conectado (`DRIVE_NO_CONECTADO`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502": { $ref: "#/components/responses/ErrorDrive" }
+
+  # ===================== ARCHIVOS (prototipo) =====================
+  /api/archivos:
+    get:
+      tags: [Archivos]
+      summary: Lista los archivos del usuario (más recientes primero)
+      responses:
+        "200":
+          description: Lista
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  archivos:
+                    type: array
+                    items: { $ref: "#/components/schemas/Archivo" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+
+  /api/archivos/upload:
+    post:
+      tags: [Archivos]
+      summary: Sube un archivo a Drive (sin documento asociado)
+      description: |
+        Patrón del prototipo, se mantiene por compatibilidad. No valida tipo ni firma (pendiente).
+        Para documentos nuevos usar `POST /api/documentos`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [archivo]
+              properties:
+                archivo: { type: string, format: binary, description: Máx. 10 MB }
+      responses:
+        "201":
+          description: Subido
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mensaje: { type: string, example: Archivo subido correctamente. }
+                  archivo: { $ref: "#/components/schemas/Archivo" }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "409":
+          description: Drive no conectado (`DRIVE_NO_CONECTADO`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413": { $ref: "#/components/responses/ArchivoGrande" }
+        "502": { $ref: "#/components/responses/ErrorDrive" }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+
+  /api/archivos/{id}/descargar:
+    get:
+      tags: [Archivos]
+      summary: Descarga un archivo (streaming, `attachment`)
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Contenido binario
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "404": { $ref: "#/components/responses/NoEncontrado" }
+        "409":
+          description: Drive no conectado (`DRIVE_NO_CONECTADO`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502": { $ref: "#/components/responses/ErrorDrive" }
+
+  /api/archivos/{id}:
+    delete:
+      tags: [Archivos]
+      summary: Borra el archivo de Drive y de la BD
+      description: |
+        Responde 409 CONFLICTO si el archivo pertenece a un documento (hay que borrar el documento).
+        Si ya no existía en Drive, solo se elimina el registro (el `mensaje` lo indica).
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Eliminado
+          content:
+            application/json:
+              example: { mensaje: Archivo eliminado correctamente. }
+        "400": { $ref: "#/components/responses/Validacion" }
+        "401": { $ref: "#/components/responses/NoAutenticado" }
+        "404": { $ref: "#/components/responses/NoEncontrado" }
+        "409": { $ref: "#/components/responses/Conflicto" }
+        "500":
+          description: Se borró de Drive pero no se pudo eliminar el registro (`REGISTRO_NO_ELIMINADO`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502": { $ref: "#/components/responses/ErrorDrive" }
+        "403": { $ref: "#/components/responses/OrigenNoPermitido" }
+
+components:
+  securitySchemes:
+    cookieSesion:
+      type: apiKey
+      in: cookie
+      name: sb-<ref-del-proyecto>-auth-token
+      description: |
+        Cookies httpOnly de sesión de Supabase (`@supabase/ssr`): `sb-<ref>-auth-token`, que puede
+        fragmentarse en `.0`, `.1`... Las fija `/auth/callback`; el frontend no las lee, solo usa
+        `credentials: 'include'`. `secure`, `sameSite` y `domain` salen de `COOKIE_SECURE`,
+        `COOKIE_SAMESITE` y `COOKIE_DOMAIN`. OpenAPI no admite prefijos ni fragmentos, así que el
+        nombre es ilustrativo.
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      description: Id bigint (solo dígitos)
+      schema: { type: string, pattern: '^[1-9]\d{0,17}$' }
+
+  responses:
+    NoAutenticado:
+      description: Sin sesión activa
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { codigo: NO_AUTENTICADO, mensaje: Tu sesión no está activa. Inicia sesión. }
+    Validacion:
+      description: |
+        Datos inválidos (`VALIDACION`). Incluye id no numérico y errores de BD de tipo
+        check, not-null, formato y fecha. También `JSON_INVALIDO` y `ARCHIVO_INVALIDO`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            codigo: VALIDACION
+            mensaje: Los datos enviados no son válidos.
+            detalles: [ { campo: fecha_vencimiento, mensaje: La fecha de vencimiento no puede ser anterior a la de emisión. } ]
+    NoEncontrado:
+      description: No existe o no pertenece al usuario
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { codigo: NO_ENCONTRADO, mensaje: Recurso no encontrado. }
+    Conflicto:
+      description: Duplicado, FK o recurso en uso
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { codigo: CONFLICTO, mensaje: Ya tienes una etiqueta con ese nombre. }
+    ArchivoGrande:
+      description: El archivo supera 10 MB
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { codigo: ARCHIVO_MUY_GRANDE, mensaje: El archivo supera el tamaño máximo de 10 MB. }
+    TipoNoPermitido:
+      description: Solo PDF, JPG o PNG
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { codigo: TIPO_NO_PERMITIDO, mensaje: Solo se permiten archivos PDF, JPG o PNG. }
+    ErrorDrive:
+      description: Google Drive respondió con error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { codigo: ERROR_DRIVE, mensaje: Google Drive no respondió correctamente. Inténtalo de nuevo. }
+    
+    OrigenNoPermitido:
+      description: |
+        `Origin` distinto del frontend, o ausente en producción (solo peticiones que modifican datos).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { codigo: ORIGEN_NO_PERMITIDO, mensaje: Origen no permitido. }
+
+  schemas:
+    Error:
+      type: object
+      required: [mensaje]
+      properties:
+        codigo:
+          type: string
+          description: |
+            VALIDACION, JSON_INVALIDO, ARCHIVO_INVALIDO, NO_AUTENTICADO,
+            NO_ENCONTRADO, RUTA_NO_ENCONTRADA, CONFLICTO, DRIVE_NO_CONECTADO,
+            ARCHIVO_MUY_GRANDE, CUERPO_MUY_GRANDE, TIPO_NO_PERMITIDO, ERROR_BD,
+            ERROR_INTERNO, REGISTRO_NO_ELIMINADO, ERROR_DRIVE, AUTH_NO_DISPONIBLE, ORIGEN_NO_PERMITIDO
+        mensaje: { type: string }
+        detalles:
+          type: array
+          items:
+            type: object
+            properties:
+              campo: { type: string }
+              mensaje: { type: string }
+
+    Salud:
+      type: object
+      properties:
+        servidor: { type: string, example: funcionando }
+        supabase: { type: string, enum: [conectado, error] }
+
+    EstadoDrive:
+      type: object
+      properties:
+        conectado: { type: boolean }
+        correo: { type: string, nullable: true }
+
+    SesionInactiva:
+      type: object
+      properties:
+        autenticado: { type: boolean, enum: [false] }
+
+    SesionActiva:
+      type: object
+      properties:
+        autenticado: { type: boolean, enum: [true] }
+        usuario:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            nombre: { type: string, description: "full_name, name, user_name, correo o 'Usuario'" }
+            correo: { type: string, nullable: true }
+            foto: { type: string, nullable: true }
+            proveedores:
+              type: array
+              items: { type: string, example: google }
+        drive: { $ref: "#/components/schemas/EstadoDrive" }
+
+    Perfil:
+      type: object
+      properties:
+        nombre: { type: string, nullable: true }
+        apellidos: { type: string, nullable: true }
+        telefono: { type: string, nullable: true }
+        avatar_url: { type: string, nullable: true }
+        zona_horaria: { type: string, example: America/Mexico_City }
+        moneda: { type: string, example: MXN }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ActualizarPerfil:
+      type: object
+      minProperties: 1
+      properties:
+        nombre: { type: string, maxLength: 80, nullable: true }
+        apellidos: { type: string, maxLength: 120, nullable: true }
+        telefono: { type: string, pattern: '^[+\d][\d\s()-]{6,19}$', nullable: true }
+        zona_horaria: { type: string, description: Zona IANA válida }
+        moneda: { type: string, enum: [MXN] }
+
+    Categoria:
+      type: object
+      properties:
+        slug: { $ref: "#/components/schemas/SlugCategoria" }
+        nombre: { type: string }
+
+    SlugCategoria:
+      type: string
+      enum: [identidad, vivienda, salud, vehiculos, trabajo, finanzas]
+
+    EstadoDocumento:
+      type: string
+      description: Calculado, no es columna. por_vencer = vence en 30 días o menos.
+      enum: [vigente, por_vencer, vencido, sin_vencimiento]
+
+    Etiqueta:
+      type: object
+      properties:
+        id: { type: integer }
+        nombre: { type: string }
+        created_at: { type: string, format: date-time }
+
+    NombreEtiqueta:
+      type: object
+      required: [nombre]
+      properties:
+        nombre: { type: string, minLength: 1, maxLength: 40 }
+
+    RespuestaEtiqueta:
+      type: object
+      properties:
+        mensaje: { type: string }
+        etiqueta: { $ref: "#/components/schemas/Etiqueta" }
+
+    Archivo:
+      type: object
+      properties:
+        id: { type: integer }
+        nombre_archivo: { type: string }
+        drive_file_id: { type: string, description: Solo en `/api/archivos`; no se incluye dentro de `documento.archivo` }
+        fecha_carga: { type: string, format: date-time }
+
+    Documento:
+      type: object
+      properties:
+        id: { type: integer }
+        nombre: { type: string }
+        descripcion: { type: string, nullable: true }
+        categoria: { $ref: "#/components/schemas/SlugCategoria" }
+        fecha_emision: { type: string, format: date, nullable: true }
+        fecha_vencimiento: { type: string, format: date, nullable: true }
+        institucion_emisora: { type: string, nullable: true }
+        estado: { $ref: "#/components/schemas/EstadoDocumento" }
+        etiquetas:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              nombre: { type: string }
+        archivo:
+          type: object
+          nullable: true
+          properties:
+            id: { type: integer }
+            nombre_archivo: { type: string }
+            fecha_carga: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    RespuestaDocumento:
+      type: object
+      properties:
+        mensaje: { type: string }
+        documento: { $ref: "#/components/schemas/Documento" }
+
+    Paginacion:
+      type: object
+      properties:
+        total: { type: integer, nullable: true, description: null si el offset está fuera de rango }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    CrearDocumento:
+      type: object
+      required: [archivo, nombre, categoria]
+      properties:
+        archivo: { type: string, format: binary, description: PDF, JPG o PNG; máx. 10 MB }
+        nombre: { type: string, minLength: 1, maxLength: 150 }
+        categoria: { $ref: "#/components/schemas/SlugCategoria" }
+        descripcion: { type: string, maxLength: 1000 }
+        fecha_emision: { type: string, format: date }
+        fecha_vencimiento: { type: string, format: date, description: Debe ser mayor o igual a fecha_emision }
+        institucion_emisora: { type: string, maxLength: 150 }
+        etiquetas: { type: string, description: 'Lista de ids como texto JSON, máx. 20. Ej. "[1,2]"', example: "[1,2]" }
+
+    ActualizarDocumento:
+      type: object
+      minProperties: 1
+      properties:
+        nombre: { type: string, minLength: 1, maxLength: 150 }
+        categoria: { $ref: "#/components/schemas/SlugCategoria" }
+        descripcion: { type: string, maxLength: 1000, nullable: true }
+        fecha_emision: { type: string, format: date, nullable: true }
+        fecha_vencimiento: { type: string, format: date, nullable: true }
+        institucion_emisora: { type: string, maxLength: 150, nullable: true }
+        etiquetas:
+          type: array
+          maxItems: 20
+          items: { type: integer, minimum: 1 }
+          description: Reemplaza el conjunto completo

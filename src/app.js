@@ -1,4 +1,4 @@
-import express from 'express';
+/*import express from 'express';
 import cors from 'cors';
 
 import { env } from './config/env.js';
@@ -39,6 +39,40 @@ app.use('/auth', authRoutes);
 app.use('/api/session', sessionRoutes);
 app.use('/api/drive', driveRoutes);
 app.use('/api/archivos', archivosRoutes);
+
+app.use(noEncontrado);
+app.use(manejarErrores);
+
+export default app;*/
+
+import express from 'express';
+import cors from 'cors';
+
+import { env } from './config/env.js';
+import { sinCache, validarOrigen } from './middleware/seguridad.js';
+import { manejarErrores, noEncontrado } from './middleware/errores.js';
+
+import authRoutes from './routes/auth.routes.js';
+import apiRoutes from './routes/index.js';
+
+const app = express();
+
+app.set('trust proxy', 1);
+
+app.use(cors({ origin: env.CLIENT_URL, credentials: true }));
+app.use(express.json());
+app.use(sinCache);
+app.use(validarOrigen);
+
+app.get('/', (req, res) => {
+  res.json({ mensaje: 'API de Mi Vida Digital funcionando' });
+});
+
+// Flujo OAuth del navegador (redirecciones).
+app.use('/auth', authRoutes);
+
+// API REST.
+app.use('/api', apiRoutes);
 
 app.use(noEncontrado);
 app.use(manejarErrores);

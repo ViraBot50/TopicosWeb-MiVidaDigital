@@ -1,6 +1,6 @@
 
 export async function obtenerOCrearCarpeta(drive) {
-  const nombreCarpeta = 'Prototipo Drive';
+  const nombreCarpeta = 'AppMiVidaDigital';
 
   const respuesta = await drive.files.list({
     q: `name = '${nombreCarpeta}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,

@@ -1,4 +1,4 @@
-import { Router } from 'express';
+/*import { Router } from 'express';
 import multer from 'multer';
 import { Readable } from 'node:stream';
 
@@ -205,5 +205,22 @@ router.delete('/:id', async (req, res) => {
     return res.status(500).json({ mensaje: 'No se pudo eliminar el archivo de Google Drive.' });
   }
 });
+
+export default router;*/
+
+// src/routes/archivos.routes.js
+import { Router } from 'express';
+import * as controlador from '../controllers/archivos.controller.js';
+import { requiereAutenticacion } from '../middleware/auth.js';
+import { subirUnArchivo } from '../middleware/subida.js';
+
+const router = Router();
+
+router.use(requiereAutenticacion());
+
+router.get('/', controlador.listar);
+router.post('/upload', subirUnArchivo, controlador.subir);
+router.get('/:id/descargar', controlador.descargar);
+router.delete('/:id', controlador.eliminar);
 
 export default router;
